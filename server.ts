@@ -4,6 +4,18 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { GoogleGenAI, Type } from '@google/genai';
 import { getKaldikJabarEvents, KALDIK_JABAR_REF } from './src/data/kaldikJabar.ts';
+import {
+  clearAllRemoteFiles,
+  deleteRemoteFile,
+  deleteRemoteSession,
+  detectStorageEngine,
+  loadRemoteFile,
+  loadRemoteSession,
+  loadRemoteState,
+  saveRemoteFile,
+  saveRemoteSession,
+  saveRemoteState
+} from './vercelDb.ts';
 
 const DB_PATH = path.resolve(process.cwd(), 'data', 'database.json');
 const CLOUD_DIR = path.resolve(process.cwd(), 'data', 'cloud_uploads');
@@ -511,36 +523,82 @@ function createSeedDatabase(): DatabaseFile {
   };
 }
 
+let remoteLoaded = false;
+let remoteLoadPromise: Promise<void> | null = null;
+let writeQueue: Promise<void> = Promise.resolve();
+
+function queueWrite(task: () => Promise<void>) {
+  writeQueue = writeQueue.then(task).catch(err => {
+    console.error('Vercel DB write error:', err);
+  });
+}
+
+async function flushWrites() {
+  await writeQueue;
+}
+
+function normalizeLoadedDb(rawDb: DatabaseFile): DatabaseFile {
+  const hadCbtKey = 'CBT' in (rawDb.sheets || {});
+  if (!rawDb.sheets) rawDb.sheets = {};
+  for (const k of Object.keys(SKEMA)) {
+    if (!rawDb.sheets[k]) rawDb.sheets[k] = [];
+  }
+  if (!hadCbtKey) {
+    const seeded = createSeedDatabase();
+    rawDb.sheets.CBT = seeded.sheets.CBT;
+  }
+  rawDb.sheets.Kelas = (rawDb.sheets.Kelas || []).map((kls: any) => {
+    if (kls.Jurusan) return kls;
+    const nm = String(kls.Nama || '').toUpperCase();
+    const inferred = nm.includes('IPS') ? 'IPS' : nm.includes('BHS') || nm.includes('BAHASA') ? 'Bahasa' : 'MIPA';
+    return { ...kls, Jurusan: inferred };
+  });
+  rawDb.sheets.Siswa = (rawDb.sheets.Siswa || []).map((s: any) => ({
+    ...s,
+    NoSiswa: s.NoSiswa || s.KontakOrtu || '',
+    NoOrtu: s.NoOrtu || ''
+  }));
+  return rawDb;
+}
+
+async function ensureDbLoaded(): Promise<void> {
+  const { isVercelCloud } = detectStorageEngine();
+  if (!isVercelCloud) {
+    getDb();
+    return;
+  }
+  if (remoteLoaded && dbCache) return;
+  if (remoteLoadPromise) return remoteLoadPromise;
+  remoteLoadPromise = (async () => {
+    const remote = await loadRemoteState();
+    if (remote && remote.sheets) {
+      dbCache = normalizeLoadedDb(remote as DatabaseFile);
+    } else {
+      let initial: DatabaseFile | null = null;
+      try {
+        if (fs.existsSync(DB_PATH)) {
+          initial = normalizeLoadedDb(JSON.parse(fs.readFileSync(DB_PATH, 'utf8')));
+        }
+      } catch (_) {}
+      dbCache = initial || createSeedDatabase();
+      await saveRemoteState(dbCache);
+    }
+    remoteLoaded = true;
+  })().finally(() => {
+    remoteLoadPromise = null;
+  });
+  return remoteLoadPromise;
+}
+
 function getDb(): DatabaseFile {
   if (dbCache) return dbCache;
   try {
     if (fs.existsSync(DB_PATH)) {
       const raw = fs.readFileSync(DB_PATH, 'utf8');
-      dbCache = JSON.parse(raw);
-      const hadCbtKey = 'CBT' in (dbCache!.sheets || {});
-      // Ensure all schema keys exist
-      for (const k of Object.keys(SKEMA)) {
-        if (!dbCache!.sheets[k]) dbCache!.sheets[k] = [];
-      }
-      if (!hadCbtKey) {
-        const seeded = createSeedDatabase();
-        dbCache!.sheets.CBT = seeded.sheets.CBT;
-        saveDb();
-      }
-      // Backfill Jurusan on existing Kelas rows if absent
-      dbCache!.sheets.Kelas = (dbCache!.sheets.Kelas || []).map((kls: any) => {
-        if (kls.Jurusan) return kls;
-        const nm = String(kls.Nama || '').toUpperCase();
-        const inferred = nm.includes('IPS') ? 'IPS' : nm.includes('BHS') || nm.includes('BAHASA') ? 'Bahasa' : 'MIPA';
-        return { ...kls, Jurusan: inferred };
-      });
-      // Backfill NoSiswa and NoOrtu on existing Siswa rows
-      dbCache!.sheets.Siswa = (dbCache!.sheets.Siswa || []).map((s: any) => ({
-        ...s,
-        NoSiswa: s.NoSiswa || s.KontakOrtu || '',
-        NoOrtu: s.NoOrtu || ''
-      }));
-      return dbCache!;
+      const hadCbtKey = 'CBT' in (JSON.parse(raw).sheets || {});
+      dbCache = normalizeLoadedDb(JSON.parse(raw));
+      if (!hadCbtKey) saveDb();
+      return dbCache;
     }
   } catch (e) {
     console.error('Failed reading DB, re-seeding:', e);
@@ -552,9 +610,16 @@ function getDb(): DatabaseFile {
 
 function saveDb() {
   if (!dbCache) return;
-  const dir = path.dirname(DB_PATH);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(DB_PATH, JSON.stringify(dbCache, null, 2), 'utf8');
+  try {
+    const dir = path.dirname(DB_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(DB_PATH, JSON.stringify(dbCache, null, 2), 'utf8');
+  } catch (_) {}
+  const { isVercelCloud } = detectStorageEngine();
+  if (isVercelCloud) {
+    const snapshot = dbCache;
+    queueWrite(() => saveRemoteState(snapshot));
+  }
 }
 
 function baca_(nama: string): Record<string, string>[] {
@@ -615,12 +680,16 @@ function cekAdmin_(user: string, pass: string): boolean {
 
 function buatSesi_(role: string, sid: string, nama: string) {
   const token = uuid() + uuid();
-  sessions.set(token, {
+  const rec = {
     role,
     sid: sid || '',
     nama: nama || '',
     expires: Date.now() + TTL_SESI
-  });
+  };
+  sessions.set(token, rec);
+  if (detectStorageEngine().isVercelCloud) {
+    queueWrite(() => saveRemoteSession(token, rec));
+  }
   return { token, role, nama: nama || '' };
 }
 
@@ -899,6 +968,7 @@ const rpcMethods: Record<string, (...args: any[]) => any> = {
     const emailHint = em.includes('@')
       ? `${em.slice(0, Math.min(2, em.indexOf('@')))}***@${em.split('@')[1]}`
       : '';
+    const storage = detectStorageEngine();
     return {
       adminAda: adminAda_(),
       sekolah: set.sekolah || 'SMA Negeri 1 Nusantara',
@@ -906,7 +976,10 @@ const rpcMethods: Record<string, (...args: any[]) => any> = {
       jurusan: set.jurusan || '',
       jurusanLogos: set.jurusanLogos || '{}',
       waInfo: set.waInfo || '',
-      emailHint
+      emailHint,
+      storageEngine: storage.engine,
+      storageLabel: storage.label,
+      vercelConfigured: storage.isVercelCloud
     };
   },
 
@@ -1150,6 +1223,9 @@ const rpcMethods: Record<string, (...args: any[]) => any> = {
 
   api_logout(token: string) {
     sessions.delete(token);
+    if (detectStorageEngine().isVercelCloud && token) {
+      queueWrite(() => deleteRemoteSession(token));
+    }
     return true;
   },
 
@@ -1186,6 +1262,10 @@ const rpcMethods: Record<string, (...args: any[]) => any> = {
     const db = getDb();
     out.adminUser = admin ? (db.admin?.user || '') : '';
     out.urlSheet = '';
+    const storage = detectStorageEngine();
+    out.storageEngine = storage.engine;
+    out.storageLabel = storage.label;
+    out.vercelConfigured = storage.isVercelCloud;
     if (admin) out.Pengguna = daftarPengguna_();
     return out;
   },
@@ -1687,7 +1767,7 @@ const rpcMethods: Record<string, (...args: any[]) => any> = {
     if (o.resetPengaturan) {
       db.sheets.Pengaturan = Object.entries(PENGATURAN_AWAL).map(([Kunci, Nilai]) => ({ Kunci, Nilai }));
     }
-    // Clear uploaded files on disk
+    // Clear uploaded files on disk & remote Vercel DB
     for (const dir of [CLOUD_DIR, TUGAS_DIR]) {
       try {
         if (fs.existsSync(dir)) {
@@ -1696,6 +1776,9 @@ const rpcMethods: Record<string, (...args: any[]) => any> = {
           }
         }
       } catch (_) {}
+    }
+    if (detectStorageEngine().isVercelCloud) {
+      queueWrite(() => clearAllRemoteFiles());
     }
     saveDb();
     return true;
@@ -1746,7 +1829,29 @@ async function startServer() {
     next();
   });
 
-  app.post('/api/rpc', (req, res) => {
+  // Hydrate Vercel DB state and active session token on every /api/* request
+  app.use('/api', async (req, res, next) => {
+    try {
+      await ensureDbLoaded();
+      const bodyToken =
+        typeof req.body?.token === 'string'
+          ? req.body.token
+          : Array.isArray(req.body?.args) && typeof req.body.args[0] === 'string'
+          ? req.body.args[0]
+          : '';
+      if (bodyToken && !sessions.has(bodyToken) && detectStorageEngine().isVercelCloud) {
+        const remoteSess = await loadRemoteSession(bodyToken);
+        if (remoteSess && Date.now() <= remoteSess.expires) {
+          sessions.set(bodyToken, remoteSess);
+        }
+      }
+      next();
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Gagal menghubungkan database Vercel.' });
+    }
+  });
+
+  app.post('/api/rpc', async (req, res) => {
     try {
       const { fn, args } = req.body || {};
       if (!fn || typeof rpcMethods[fn] !== 'function') {
@@ -1754,6 +1859,7 @@ async function startServer() {
         return;
       }
       const result = rpcMethods[fn](...(Array.isArray(args) ? args : []));
+      await flushWrites();
       res.json({ ok: true, data: result });
     } catch (e: any) {
       res.status(200).json({ ok: false, error: e?.message || String(e) });
@@ -1843,6 +1949,7 @@ async function startServer() {
         Object.keys(curSet).map(k => ({ Kunci: k, Nilai: curSet[k] }))
       );
 
+      await flushWrites();
       res.json({
         ok: true,
         data: {
@@ -1858,7 +1965,7 @@ async function startServer() {
   });
 
   // Cloud Vault Upload Endpoint
-  app.post('/api/cloud/upload', (req, res) => {
+  app.post('/api/cloud/upload', async (req, res) => {
     try {
       const { token, kelas, namaFile, tipeMime, ukuran, base64Data, teksEkstrak } = req.body || {};
       const s = sesi_(token);
@@ -1867,21 +1974,31 @@ async function startServer() {
         return;
       }
 
-      if (!fs.existsSync(CLOUD_DIR)) {
-        fs.mkdirSync(CLOUD_DIR, { recursive: true });
-      }
-
       const id = 'cld_' + uidShort();
       const safeName = String(namaFile).replace(/[^a-zA-Z0-9._-]/g, '_');
       const storedFileName = `${id}_${safeName}`;
       const fullPath = path.join(CLOUD_DIR, storedFileName);
-
       const buffer = Buffer.from(base64Data, 'base64');
-      fs.writeFileSync(fullPath, buffer);
 
-      // Save optional extracted text sidecar if provided
-      if (teksEkstrak) {
-        fs.writeFileSync(fullPath + '.txt', String(teksEkstrak), 'utf8');
+      try {
+        if (!fs.existsSync(CLOUD_DIR)) {
+          fs.mkdirSync(CLOUD_DIR, { recursive: true });
+        }
+        fs.writeFileSync(fullPath, buffer);
+        if (teksEkstrak) {
+          fs.writeFileSync(fullPath + '.txt', String(teksEkstrak), 'utf8');
+        }
+      } catch (_) {}
+
+      if (detectStorageEngine().isVercelCloud) {
+        await saveRemoteFile({
+          id,
+          kind: 'cloud',
+          filename: String(namaFile),
+          mime: String(tipeMime || 'application/octet-stream'),
+          contentBase64: String(base64Data),
+          textSidecar: teksEkstrak ? String(teksEkstrak) : ''
+        });
       }
 
       const now = new Date();
@@ -1903,6 +2020,7 @@ async function startServer() {
       const semua = baca_('BerkasCloud');
       semua.unshift(record);
       tulis_('BerkasCloud', semua);
+      await flushWrites();
 
       res.json({ ok: true, data: record });
     } catch (e: any) {
@@ -1939,10 +2057,24 @@ async function startServer() {
         mime === 'application/pdf' ||
         mime.startsWith('audio/');
 
+      let fileBuf: Buffer | null = null;
+      let sidecarText = '';
       if (fs.existsSync(fullPath)) {
-        const buf = fs.readFileSync(fullPath);
+        fileBuf = fs.readFileSync(fullPath);
+        if (fs.existsSync(fullPath + '.txt')) {
+          sidecarText = fs.readFileSync(fullPath + '.txt', 'utf8');
+        }
+      } else if (detectStorageEngine().isVercelCloud) {
+        const remote = await loadRemoteFile(rec.ID);
+        if (remote) {
+          fileBuf = Buffer.from(remote.contentBase64, 'base64');
+          sidecarText = remote.textSidecar || '';
+        }
+      }
+
+      if (fileBuf) {
         if (isTextLike) {
-          const textContent = buf.toString('utf8').slice(0, 60000);
+          const textContent = fileBuf.toString('utf8').slice(0, 60000);
           parts.push({
             text: `Nama Berkas: ${rec.NamaFile}\nTipe: ${rec.TipeMime}\nIsi Berkas:\n\`\`\`\n${textContent}\n\`\`\``
           });
@@ -1950,17 +2082,15 @@ async function startServer() {
           parts.push({
             inlineData: {
               mimeType: mime || 'image/png',
-              data: buf.toString('base64')
+              data: fileBuf.toString('base64')
             }
           });
-        } else if (fs.existsSync(fullPath + '.txt')) {
-          const sidecar = fs.readFileSync(fullPath + '.txt', 'utf8').slice(0, 60000);
+        } else if (sidecarText) {
           parts.push({
-            text: `Nama Berkas: ${rec.NamaFile}\nIsi Teks Ekstraksi:\n${sidecar}`
+            text: `Nama Berkas: ${rec.NamaFile}\nIsi Teks Ekstraksi:\n${sidecarText.slice(0, 60000)}`
           });
         } else {
-          // Try utf8 fallback extract for spreadsheet/doc
-          const rawStr = buf.toString('utf8').replace(/[^\x20-\x7E\n\r\t]/g, ' ').slice(0, 30000);
+          const rawStr = fileBuf.toString('utf8').replace(/[^\x20-\x7E\n\r\t]/g, ' ').slice(0, 30000);
           parts.push({
             text: `Nama Berkas: ${rec.NamaFile} (${rec.TipeMime}, ${rec.Ukuran} bytes).\nKonten terbaca:\n${rawStr}`
           });
@@ -2028,6 +2158,7 @@ Ekstrak informasi kunci, identifikasi tren atau pola penting, dan berikan ringka
       rec.AnalisisJSON = JSON.stringify(parsed);
       rec.StatusCloud = 'Tersimpan & Teranalisis AI';
       tulis_('BerkasCloud', semua);
+      await flushWrites();
 
       res.json({ ok: true, data: { record: rec, analisis: parsed } });
     } catch (e: any) {
@@ -2039,7 +2170,7 @@ Ekstrak informasi kunci, identifikasi tren atau pola penting, dan berikan ringka
   });
 
   // Delete Cloud File Endpoint
-  app.post('/api/cloud/delete', (req, res) => {
+  app.post('/api/cloud/delete', async (req, res) => {
     try {
       const { token, fileId } = req.body || {};
       sesi_(token);
@@ -2051,8 +2182,12 @@ Ekstrak informasi kunci, identifikasi tren atau pola penting, dan berikan ringka
           try { fs.unlinkSync(fullPath); } catch (_) {}
         }
       }
+      if (target && detectStorageEngine().isVercelCloud) {
+        await deleteRemoteFile(target.ID);
+      }
       const sisa = semua.filter(x => x.ID !== fileId);
       tulis_('BerkasCloud', sisa);
+      await flushWrites();
       res.json({ ok: true, data: sisa });
     } catch (e: any) {
       res.status(200).json({ ok: false, error: e?.message || String(e) });
@@ -2060,7 +2195,7 @@ Ekstrak informasi kunci, identifikasi tren atau pola penting, dan berikan ringka
   });
 
   // Download Cloud File Endpoint
-  app.get('/api/cloud/file/:id', (req, res) => {
+  app.get('/api/cloud/file/:id', async (req, res) => {
     try {
       const rec = baca_('BerkasCloud').find(x => x.ID === req.params.id);
       if (!rec) {
@@ -2068,13 +2203,22 @@ Ekstrak informasi kunci, identifikasi tren atau pola penting, dan berikan ringka
         return;
       }
       const fullPath = path.join(CLOUD_DIR, rec.PathSimpan);
-      if (!fs.existsSync(fullPath)) {
-        res.status(404).send('Data fisik berkas merupakan sampel pratinjau metadata.');
+      if (fs.existsSync(fullPath)) {
+        res.setHeader('Content-Type', rec.TipeMime || 'application/octet-stream');
+        res.setHeader('Content-Disposition', `attachment; filename="${rec.NamaFile}"`);
+        res.sendFile(fullPath);
         return;
       }
-      res.setHeader('Content-Type', rec.TipeMime || 'application/octet-stream');
-      res.setHeader('Content-Disposition', `attachment; filename="${rec.NamaFile}"`);
-      res.sendFile(fullPath);
+      if (detectStorageEngine().isVercelCloud) {
+        const remote = await loadRemoteFile(rec.ID);
+        if (remote) {
+          res.setHeader('Content-Type', rec.TipeMime || remote.mime || 'application/octet-stream');
+          res.setHeader('Content-Disposition', `attachment; filename="${rec.NamaFile}"`);
+          res.send(Buffer.from(remote.contentBase64, 'base64'));
+          return;
+        }
+      }
+      res.status(404).send('Data fisik berkas merupakan sampel pratinjau metadata.');
     } catch (e) {
       res.status(500).send('Gagal mengunduh berkas');
     }
@@ -2262,7 +2406,7 @@ ATURAN KETAT SUMBER MATERI:
   });
 
   // Student submits CBT PG & Uraian answers
-  app.post('/api/cbt/submit', (req, res) => {
+  app.post('/api/cbt/submit', async (req, res) => {
     try {
       const { token, cbtId, jawabanPG, jawabanUraian, mulai } = req.body || {};
       const sesi = sesi_(token, 'siswa');
@@ -2325,6 +2469,7 @@ ATURAN KETAT SUMBER MATERI:
 
       semuaHasil.push(record);
       tulis_('HasilCBT', semuaHasil);
+      await flushWrites();
       res.json({ ok: true, data: record });
     } catch (e: any) {
       res.status(200).json({ ok: false, error: e?.message || String(e) });
@@ -2421,6 +2566,7 @@ ATURAN KETAT SUMBER MATERI:
       hasil.StatusNilai = 'Dinilai AI';
 
       tulis_('HasilCBT', semuaHasil);
+      await flushWrites();
       res.json({ ok: true, data: hasil });
     } catch (e: any) {
       res.status(200).json({ ok: false, error: e?.message || 'Gagal menilai uraian dengan AI.' });
@@ -2428,7 +2574,7 @@ ATURAN KETAT SUMBER MATERI:
   });
 
   // Teacher manually saves/confirms CBT grades
-  app.post('/api/cbt/save-grade', (req, res) => {
+  app.post('/api/cbt/save-grade', async (req, res) => {
     try {
       const { token, hasilId, skorUraian, skorAkhir, catatanGuru } = req.body || {};
       staf_(token);
@@ -2450,6 +2596,7 @@ ATURAN KETAT SUMBER MATERI:
       }
       hasil.StatusNilai = 'Final';
       tulis_('HasilCBT', semuaHasil);
+      await flushWrites();
       res.json({ ok: true, data: hasil });
     } catch (e: any) {
       res.status(200).json({ ok: false, error: e?.message || String(e) });
@@ -2457,7 +2604,7 @@ ATURAN KETAT SUMBER MATERI:
   });
 
   // Upload Teacher Attachment for Tugas
-  app.post('/api/tugas/upload-soal', (req, res) => {
+  app.post('/api/tugas/upload-soal', async (req, res) => {
     try {
       const { token, namaFile, base64Data } = req.body || {};
       staf_(token);
@@ -2465,12 +2612,23 @@ ATURAN KETAT SUMBER MATERI:
         res.status(400).json({ ok: false, error: 'Pilih berkas lampiran tugas terlebih dahulu.' });
         return;
       }
-      if (!fs.existsSync(TUGAS_DIR)) fs.mkdirSync(TUGAS_DIR, { recursive: true });
       const fileId = 'tgs_' + uidShort();
       const cleanName = String(namaFile).replace(/[^a-zA-Z0-9._-]/g, '_');
       const diskName = `${fileId}__${cleanName}`;
       const buf = Buffer.from(String(base64Data), 'base64');
-      fs.writeFileSync(path.join(TUGAS_DIR, diskName), buf);
+      try {
+        if (!fs.existsSync(TUGAS_DIR)) fs.mkdirSync(TUGAS_DIR, { recursive: true });
+        fs.writeFileSync(path.join(TUGAS_DIR, diskName), buf);
+      } catch (_) {}
+      if (detectStorageEngine().isVercelCloud) {
+        await saveRemoteFile({
+          id: fileId,
+          kind: 'tugas',
+          filename: String(namaFile),
+          mime: 'application/octet-stream',
+          contentBase64: String(base64Data)
+        });
+      }
       res.json({ ok: true, data: { fileId, namaFile: String(namaFile) } });
     } catch (e: any) {
       res.status(200).json({ ok: false, error: e?.message || String(e) });
@@ -2478,7 +2636,7 @@ ATURAN KETAT SUMBER MATERI:
   });
 
   // Student Submits Assignment File
-  app.post('/api/tugas/submit', (req, res) => {
+  app.post('/api/tugas/submit', async (req, res) => {
     try {
       const { token, tugasId, namaFile, base64Data, catatan } = req.body || {};
       const sesi = sesi_(token, 'siswa');
@@ -2495,12 +2653,23 @@ ATURAN KETAT SUMBER MATERI:
         return;
       }
 
-      if (!fs.existsSync(TUGAS_DIR)) fs.mkdirSync(TUGAS_DIR, { recursive: true });
       const fileId = 'tsis_' + uidShort();
       const cleanName = String(namaFile).replace(/[^a-zA-Z0-9._-]/g, '_');
       const diskName = `${fileId}__${cleanName}`;
       const buf = Buffer.from(String(base64Data), 'base64');
-      fs.writeFileSync(path.join(TUGAS_DIR, diskName), buf);
+      try {
+        if (!fs.existsSync(TUGAS_DIR)) fs.mkdirSync(TUGAS_DIR, { recursive: true });
+        fs.writeFileSync(path.join(TUGAS_DIR, diskName), buf);
+      } catch (_) {}
+      if (detectStorageEngine().isVercelCloud) {
+        await saveRemoteFile({
+          id: fileId,
+          kind: 'tugas',
+          filename: String(namaFile),
+          mime: 'application/octet-stream',
+          contentBase64: String(base64Data)
+        });
+      }
 
       const now = new Date();
       const todayYmd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
@@ -2523,6 +2692,7 @@ ATURAN KETAT SUMBER MATERI:
       else semuaPg.push(updated);
 
       tulis_('Pengumpulan', semuaPg);
+      await flushWrites();
       res.json({ ok: true, data: updated });
     } catch (e: any) {
       res.status(200).json({ ok: false, error: e?.message || String(e) });
@@ -2530,28 +2700,38 @@ ATURAN KETAT SUMBER MATERI:
   });
 
   // Download Tugas / Student Submission File
-  app.get('/api/tugas/file/:fileId', (req, res) => {
+  app.get('/api/tugas/file/:fileId', async (req, res) => {
     try {
       const fileId = String(req.params.fileId || '').replace(/[^a-zA-Z0-9_-]/g, '');
-      if (!fileId || !fs.existsSync(TUGAS_DIR)) {
+      if (!fileId) {
         res.status(404).send('Berkas tugas tidak ditemukan');
         return;
       }
-      const match = fs.readdirSync(TUGAS_DIR).find(f => f.startsWith(fileId + '__'));
-      if (!match) {
-        res.status(404).send('Berkas tugas tidak ditemukan');
-        return;
+      if (fs.existsSync(TUGAS_DIR)) {
+        const match = fs.readdirSync(TUGAS_DIR).find(f => f.startsWith(fileId + '__'));
+        if (match) {
+          const origName = match.slice((fileId + '__').length);
+          res.setHeader('Content-Disposition', `attachment; filename="${origName}"`);
+          res.sendFile(path.join(TUGAS_DIR, match));
+          return;
+        }
       }
-      const origName = match.slice((fileId + '__').length);
-      res.setHeader('Content-Disposition', `attachment; filename="${origName}"`);
-      res.sendFile(path.join(TUGAS_DIR, match));
+      if (detectStorageEngine().isVercelCloud) {
+        const remote = await loadRemoteFile(fileId);
+        if (remote) {
+          res.setHeader('Content-Disposition', `attachment; filename="${remote.filename}"`);
+          res.send(Buffer.from(remote.contentBase64, 'base64'));
+          return;
+        }
+      }
+      res.status(404).send('Berkas tugas tidak ditemukan');
     } catch {
       res.status(500).send('Gagal mengunduh berkas tugas');
     }
   });
 
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true });
+    res.json({ ok: true, storage: detectStorageEngine() });
   });
 
   app.all('/api/*', (_req, res) => {
@@ -2560,45 +2740,51 @@ ATURAN KETAT SUMBER MATERI:
 
   let viteMiddleware: any = null;
 
-  if (process.env.NODE_ENV !== 'production') {
-    app.use((req, res, next) => {
-      if (viteMiddleware) {
-        viteMiddleware(req, res, next);
-        return;
+  if (!process.env.VERCEL) {
+    if (process.env.NODE_ENV !== 'production') {
+      app.use((req, res, next) => {
+        if (viteMiddleware) {
+          viteMiddleware(req, res, next);
+          return;
+        }
+        res
+          .status(503)
+          .set('Retry-After', '1')
+          .send(
+            '<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="1"><title>Menyiapkan Aplikasi</title></head><body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;color:#334155">Menyiapkan layanan aplikasi…</body></html>'
+          );
+      });
+    } else {
+      const distPath = path.join(process.cwd(), 'dist');
+      app.use(express.static(distPath));
+      app.get('*', (_req, res) => {
+        res.sendFile(path.join(distPath, 'index.html'));
+      });
+    }
+
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Server running on http://localhost:${PORT} [${detectStorageEngine().label}]`);
+      if (process.env.NODE_ENV !== 'production') {
+        import('vite')
+          .then(({ createServer: createViteServer }) =>
+            createViteServer({
+              server: { middlewareMode: true },
+              appType: 'spa'
+            })
+          )
+          .then(vite => {
+            viteMiddleware = vite.middlewares;
+          })
+          .catch(err => {
+            console.error('Failed to initialize Vite dev middleware:', err);
+          });
       }
-      res
-        .status(503)
-        .set('Retry-After', '1')
-        .send(
-          '<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="1"><title>Menyiapkan Aplikasi</title></head><body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;color:#334155">Menyiapkan layanan aplikasi…</body></html>'
-        );
-    });
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-    if (process.env.NODE_ENV !== 'production') {
-      import('vite')
-        .then(({ createServer: createViteServer }) =>
-          createViteServer({
-            server: { middlewareMode: true },
-            appType: 'spa'
-          })
-        )
-        .then(vite => {
-          viteMiddleware = vite.middlewares;
-        })
-        .catch(err => {
-          console.error('Failed to initialize Vite dev middleware:', err);
-        });
-    }
-  });
+  return app;
 }
 
-startServer();
+export const appPromise = startServer();
+export default appPromise;
+

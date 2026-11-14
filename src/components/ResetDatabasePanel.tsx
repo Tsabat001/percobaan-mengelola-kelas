@@ -144,7 +144,7 @@ export default function ResetDatabasePanel({
         </button>
       </div>
 
-      {/* Local Database Status Overview */}
+      {/* Database Status Overview */}
       <div className="bg-white border border-indigo-100 rounded-2xl p-6 shadow-sm space-y-5">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="flex items-start gap-3.5">
@@ -156,12 +156,20 @@ export default function ResetDatabasePanel({
                 <h2 className="text-base font-bold text-slate-900">
                   Ringkasan Basis Data Aplikasi
                 </h2>
-                <span className="px-2.5 py-0.5 text-[11px] font-bold rounded-full border bg-emerald-50 text-emerald-700 border-emerald-200 inline-flex items-center gap-1">
-                  <CheckCircle2 className="w-3 h-3" /> Server Lokal Aktif
-                </span>
+                {db.vercelConfigured ? (
+                  <span className="px-2.5 py-0.5 text-[11px] font-bold rounded-full border bg-emerald-50 text-emerald-700 border-emerald-200 inline-flex items-center gap-1">
+                    <CheckCircle2 className="w-3 h-3" /> {db.storageLabel || 'Vercel Database Aktif'}
+                  </span>
+                ) : (
+                  <span className="px-2.5 py-0.5 text-[11px] font-bold rounded-full border bg-sky-50 text-sky-700 border-sky-200 inline-flex items-center gap-1">
+                    <CheckCircle2 className="w-3 h-3" /> {db.storageLabel || 'Server Lokal Aktif'} · Siap Vercel DB
+                  </span>
+                )}
               </div>
               <p className="text-xs text-slate-500 mt-1">
-                Seluruh data sekolah, absensi, nilai, jadwal, dan CBT disimpan langsung pada penyimpanan server aplikasi.
+                {db.vercelConfigured
+                  ? `Seluruh data sekolah, sesi login, berkas cloud, nilai, jadwal, dan CBT tersimpan persisten di ${db.storageLabel || 'Vercel Database'}.`
+                  : 'Saat ini data tersimpan di server lokal aplikasi. Untuk deployment Vercel, hubungkan Vercel Postgres (POSTGRES_URL / DATABASE_URL) atau Vercel KV (KV_REST_API_URL & KV_REST_API_TOKEN) pada Environment Variables proyek Vercel Anda.'}
               </p>
             </div>
           </div>

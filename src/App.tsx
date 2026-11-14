@@ -489,19 +489,6 @@ export default function App() {
     }
   }
 
-  async function quickDemoLogin(mode: 'admin' | 'siswa', user: string, pass: string) {
-    setLoginMode(mode);
-    setLoginUser(user);
-    setLoginPass(pass);
-    setLoginErr('Masuk otomatis…');
-    try {
-      const r = await callRaw('api_login', mode, user, pass);
-      await masukSesi(r.token, r.role);
-    } catch (err: any) {
-      setLoginErr(pesanErr(err));
-    }
-  }
-
   async function handleSendEmailOtp() {
     setForgotOk(false);
     const u = forgotUser.trim();
@@ -1606,48 +1593,6 @@ export default function App() {
                 <MessageCircle className="w-4 h-4" />
                 Hubungi WhatsApp Informasi Sekolah
               </a>
-            )}
-
-            {adminAda && !forgotMode && (
-              <div className="pt-4 border-t border-slate-200 space-y-2.5">
-                <div className="text-[11px] font-semibold text-slate-500">
-                  Akses Cepat Akun Pratinjau Otomatis (1-Klik):
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => quickDemoLogin('admin', 'admin', 'admin12345')}
-                    className="px-3 py-2 text-left rounded-xl border border-rose-200 bg-gradient-to-br from-rose-50 to-orange-50/60 hover:border-rose-300 transition-colors cursor-pointer"
-                  >
-                    <div className="text-xs font-bold text-rose-950">Admin Utama</div>
-                    <div className="text-[11px] text-rose-700 font-mono">admin / admin12345</div>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => quickDemoLogin('admin', 'ratna', 'guru12345')}
-                    className="px-3 py-2 text-left rounded-xl border border-emerald-200 bg-gradient-to-br from-emerald-50 to-teal-50/60 hover:border-emerald-300 transition-colors cursor-pointer"
-                  >
-                    <div className="text-xs font-bold text-emerald-950">Wali & Guru Mapel</div>
-                    <div className="text-[11px] text-emerald-700 font-mono">ratna / guru12345</div>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => quickDemoLogin('siswa', '102601', '123456')}
-                    className="px-3 py-2 text-left rounded-xl border border-sky-200 bg-gradient-to-br from-sky-50 to-cyan-50/60 hover:border-sky-300 transition-colors cursor-pointer"
-                  >
-                    <div className="text-xs font-bold text-sky-950">Siswa (Sekretaris)</div>
-                    <div className="text-[11px] text-sky-700 font-mono">NIS 102601 / 123456</div>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => quickDemoLogin('siswa', '102602', '123456')}
-                    className="px-3 py-2 text-left rounded-xl border border-violet-200 bg-gradient-to-br from-violet-50 to-fuchsia-50/60 hover:border-violet-300 transition-colors cursor-pointer"
-                  >
-                    <div className="text-xs font-bold text-violet-950">Siswa (Ketua Kelas)</div>
-                    <div className="text-[11px] text-violet-700 font-mono">NIS 102602 / 123456</div>
-                  </button>
-                </div>
-              </div>
             )}
               </>
             )}
